@@ -1,7 +1,6 @@
 """
-📋 Identity Forge Bot - Professional Document Generator
-Generate ID Cards, NIN, Driver's Licenses, and more!
-Convert and validate identity documents
+🔐 Identity Forge Bot - Professional Identity Verification & Document Generator
+With Photo Upload Support for all ID documents
 """
 
 import os
@@ -11,18 +10,20 @@ import json
 import logging
 import random
 import string
+import hashlib
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from PIL import Image, ImageDraw, ImageFont
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
+    filters,
+    ConversationHandler
 )
 
 # ==================== LOGGING ====================
@@ -42,7 +43,6 @@ BOT_TOKEN = (
     os.environ.get("BOT_TOKEN")
 )
 
-# If token is not set, try reading from .env file
 if not BOT_TOKEN:
     try:
         from dotenv import load_dotenv
@@ -55,7 +55,6 @@ if not BOT_TOKEN:
     except:
         pass
 
-# If still no token, show error
 if not BOT_TOKEN:
     logger.error("=" * 60)
     logger.error("❌ ERROR: No Telegram Bot Token found!")
@@ -64,29 +63,7 @@ if not BOT_TOKEN:
 
 BOT_NAME = "Identity Forge Bot"
 BOT_USERNAME = "identity_forge_bot"
-BOT_VERSION = "1.0.0"
-
-# ==================== CONSTANTS ====================
-
-# Document types
-DOCUMENT_TYPES = {
-    "id_card": {"name": "🪪 ID Card", "prefix": "ID"},
-    "nin": {"name": "🔢 NIN", "prefix": "NIN"},
-    "drivers_license": {"name": "🚗 Driver's License", "prefix": "DL"},
-    "passport": {"name": "🛂 Passport", "prefix": "PP"},
-    "voter_id": {"name": "🗳️ Voter ID", "prefix": "VID"},
-    "student_id": {"name": "🎓 Student ID", "prefix": "SID"},
-}
-
-# Nigerian states for NIN generation
-NIGERIAN_STATES = [
-    "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa",
-    "Benue", "Borno", "Cross River", "Delta", "Ebonyi", "Edo",
-    "Ekiti", "Enugu", "FCT", "Gombe", "Imo", "Jigawa",
-    "Kaduna", "Kano", "Katsina", "Kebbi", "Kogi", "Kwara",
-    "Lagos", "Nasarawa", "Niger", "Ogun", "Ondo", "Osun",
-    "Oyo", "Plateau", "Rivers", "Sokoto", "Taraba", "Yobe", "Zamfara"
-]
+BOT_VERSION = "2.0.0"
 
 # ==================== USER DATA ====================
 
@@ -96,12 +73,15 @@ def get_user_data(user_id: int) -> Dict:
     """Get or create user data"""
     if user_id not in user_data:
         user_data[user_id] = {
+            "personal_info": {},
+            "verification": {},
+            "consent": {},
+            "documents": [],
+            "photos": [],  # Store photo file_ids
             "total_generated": 0,
-            "history": [],
-            "settings": {
-                "default_document": "id_card",
-                "color_scheme": "blue",
-            }
+            "status": "pending",
+            "registration_date": datetime.now().isoformat(),
+            "last_activity": datetime.now().isoformat(),
         }
     return user_data[user_id]
 
@@ -110,95 +90,94 @@ def get_user_data(user_id: int) -> Dict:
 def get_main_keyboard():
     """Create main menu keyboard"""
     keyboard = [
-        [InlineKeyboardButton("🪪 ID Card Generator", callback_data="gen_id")],
-        [InlineKeyboardButton("🔢 NIN Generator", callback_data="gen_nin")],
-        [InlineKeyboardButton("🚗 Driver's License", callback_data="gen_license")],
-        [InlineKeyboardButton("🛂 Passport", callback_data="gen_passport")],
-        [InlineKeyboardButton("📋 All Documents", callback_data="all_docs")],
-        [InlineKeyboardButton("🔄 Document Converter", callback_data="convert_doc")],
-        [InlineKeyboardButton("✅ Document Validator", callback_data="validate_doc")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+        [InlineKeyboardButton("📝 Start Registration", callback_data="register")],
+        [InlineKeyboardButton("📸 Upload Photo", callback_data="upload_photo")],
+        [InlineKeyboardButton("🪪 Generate ID Card", callback_data="gen_id")],
+        [InlineKeyboardButton("🔢 Generate NIN", callback_data="gen_nin")],
+        [InlineKeyboardButton("🚗 Generate License", callback_data="gen_license")],
+        [InlineKeyboardButton("📋 My Documents", callback_data="my_docs")],
+        [InlineKeyboardButton("📊 Verification Status", callback_data="verification_status")],
+        [InlineKeyboardButton("🗑️ Delete My Data", callback_data="delete_data")],
         [InlineKeyboardButton("❓ Help", callback_data="help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_photo_keyboard():
+    """Create photo upload keyboard"""
+    keyboard = [
+        [InlineKeyboardButton("📸 Upload New Photo", callback_data="upload_photo")],
+        [InlineKeyboardButton("🔄 Change Photo", callback_data="change_photo")],
+        [InlineKeyboardButton("📋 View My Photo", callback_data="view_photo")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_document_keyboard():
     """Create document type selection keyboard"""
     keyboard = [
-        [InlineKeyboardButton("🪪 ID Card", callback_data="doc_id_card")],
+        [InlineKeyboardButton("🪪 National ID", callback_data="doc_national_id")],
         [InlineKeyboardButton("🔢 NIN", callback_data="doc_nin")],
         [InlineKeyboardButton("🚗 Driver's License", callback_data="doc_drivers_license")],
         [InlineKeyboardButton("🛂 Passport", callback_data="doc_passport")],
-        [InlineKeyboardButton("🗳️ Voter ID", callback_data="doc_voter_id")],
-        [InlineKeyboardButton("🎓 Student ID", callback_data="doc_student_id")],
+        [InlineKeyboardButton("📋 All Documents", callback_data="all_docs")],
         [InlineKeyboardButton("🔙 Back", callback_data="back")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_color_keyboard():
-    """Create color scheme selection keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("🔵 Blue", callback_data="color_blue")],
-        [InlineKeyboardButton("🟢 Green", callback_data="color_green")],
-        [InlineKeyboardButton("🔴 Red", callback_data="color_red")],
-        [InlineKeyboardButton("🟣 Purple", callback_data="color_purple")],
-        [InlineKeyboardButton("🟠 Orange", callback_data="color_orange")],
-        [InlineKeyboardButton("⚫ Black", callback_data="color_black")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# ==================== CONVERSATION STATES ====================
 
-def get_document_options_keyboard(doc_type: str):
-    """Create document options keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("🔄 Generate New", callback_data=f"gen_{doc_type}")],
-        [InlineKeyboardButton("📥 Export as PNG", callback_data=f"export_{doc_type}")],
-        [InlineKeyboardButton("📋 Convert Format", callback_data="convert_doc")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# Registration states
+(
+    NAME, DOB, GENDER, PHONE, EMAIL,
+    COUNTRY, ADDRESS, ID_TYPE, ID_NUMBER,
+    NIN, BVN, CONSENT, PHOTO_UPLOAD
+) = range(13)
 
-# ==================== DOCUMENT GENERATION FUNCTIONS ====================
+# ==================== DOCUMENT GENERATION WITH PHOTO ====================
 
-def generate_nin() -> Dict:
-    """Generate a Nigerian National Identification Number"""
-    # Format: 11 digits with check digit
-    nin = []
-    for i in range(10):
-        nin.append(str(random.randint(0, 9)))
-    
-    # Calculate check digit (simple checksum)
-    total = sum(int(d) for d in nin)
-    check_digit = (total * 3) % 10
-    nin.append(str(check_digit))
-    
-    state = random.choice(NIGERIAN_STATES)
-    birth_date = datetime.now() - timedelta(days=random.randint(6570, 21900))
-    
-    return {
-        "number": "".join(nin),
-        "state": state,
-        "birth_date": birth_date.strftime("%d/%m/%Y"),
-        "issue_date": datetime.now().strftime("%d/%m/%Y"),
-        "expiry_date": (datetime.now() + timedelta(days=365*5)).strftime("%d/%m/%Y"),
-    }
-
-def generate_id_card(data: Dict = None) -> bytes:
-    """Generate an ID card image"""
-    if data is None:
-        data = {
-            "full_name": "John Doe",
-            "id_number": "ID-2024-001",
-            "department": "Technology",
-            "role": "Software Engineer",
-            "issue_date": datetime.now().strftime("%d/%m/%Y"),
-            "expiry_date": (datetime.now() + timedelta(days=365*2)).strftime("%d/%m/%Y"),
-            "color": "blue",
-        }
-    
+def resize_and_crop_image(image_data: bytes, target_size: Tuple[int, int]) -> bytes:
+    """Resize and crop image to fit ID photo requirements"""
     try:
-        # Create card image
-        width, height = 600, 380
+        img = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Crop to square
+        width, height = img.size
+        if width > height:
+            crop_size = height
+            left = (width - height) // 2
+            img = img.crop((left, 0, left + height, height))
+        else:
+            crop_size = width
+            top = (height - width) // 2
+            img = img.crop((0, top, width, top + width))
+        
+        # Resize to target
+        img = img.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # Enhance image
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.1)
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.2)
+        
+        # Convert to bytes
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='JPEG', quality=95)
+        img_bytes.seek(0)
+        return img_bytes.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Image processing error: {e}")
+        return None
+
+def generate_id_card_with_photo(user_data: Dict, photo_data: bytes = None) -> bytes:
+    """Generate a realistic ID card with user photo"""
+    try:
+        width, height = 600, 400
         img = Image.new('RGB', (width, height), color='#FFFFFF')
         draw = ImageDraw.Draw(img)
         
@@ -207,62 +186,92 @@ def generate_id_card(data: Dict = None) -> bytes:
             font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
             font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
             font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
         except:
             font_large = ImageFont.load_default()
             font_medium = ImageFont.load_default()
             font_small = ImageFont.load_default()
+            font_bold = ImageFont.load_default()
         
-        # Color schemes
-        colors = {
-            "blue": ("#1a73e8", "#e8f0fe"),
-            "green": ("#2e7d32", "#e8f5e9"),
-            "red": ("#c62828", "#ffebee"),
-            "purple": ("#6a1b9a", "#f3e5f5"),
-            "orange": ("#e65100", "#fff3e0"),
-            "black": ("#263238", "#eceff1"),
-        }
-        
-        primary_color, bg_color = colors.get(data.get("color", "blue"), colors["blue"])
+        # Official colors
+        primary_color = "#0d47a1"
+        secondary_color = "#1565c0"
+        accent_color = "#FFD700"
+        bg_color = "#f5f5f5"
         
         # Draw background
         draw.rectangle([0, 0, width, height], fill=bg_color)
+        draw.rectangle([0, 0, width, 85], fill=primary_color)
+        draw.rectangle([0, 85, width, 90], fill=secondary_color)
         
-        # Draw header bar
-        draw.rectangle([0, 0, width, 80], fill=primary_color)
+        # Draw official seal/logo
+        draw.ellipse([20, 15, 60, 55], outline="#FFFFFF", width=2)
+        draw.text((30, 30), "⚡", fill="#FFD700", font=font_large)
         
         # Draw title
-        draw.text((20, 20), "IDENTITY CARD", fill="#FFFFFF", font=font_large)
+        draw.text((80, 20), "FEDERAL REPUBLIC OF NIGERIA", fill="#FFFFFF", font=font_small)
+        draw.text((80, 42), "NATIONAL IDENTITY CARD", fill="#FFD700", font=font_large)
         
-        # Draw photo placeholder
-        draw.rectangle([30, 100, 150, 280], outline=primary_color, width=2)
-        draw.text((60, 180), "PHOTO", fill="#888888", font=font_medium)
+        # Draw ID number
+        id_number = user_data.get("id_number", f"NID-{datetime.now().year}-{random.randint(100, 999)}")
+        draw.text((width - 200, 25), f"ID: {id_number}", fill="#FFFFFF", font=font_bold)
         
-        # Draw details
-        y_start = 110
-        labels = [
-            ("Name:", data.get("full_name", "John Doe")),
-            ("ID Number:", data.get("id_number", "ID-2024-001")),
-            ("Department:", data.get("department", "Technology")),
-            ("Role:", data.get("role", "Software Engineer")),
-            ("Issue Date:", data.get("issue_date", "01/01/2024")),
-            ("Expiry Date:", data.get("expiry_date", "01/01/2026")),
+        # Draw photo
+        if photo_data:
+            try:
+                # Resize photo for ID card
+                photo = Image.open(io.BytesIO(photo_data))
+                photo = photo.resize((140, 180), Image.Resampling.LANCZOS)
+                
+                # Create rounded corners
+                mask = Image.new('L', (140, 180), 0)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rounded_rectangle([(0, 0), (140, 180)], radius=10, fill=255)
+                
+                # Apply mask
+                photo.putalpha(mask)
+                
+                # Paste photo
+                img.paste(photo, (30, 105), photo)
+                
+                # Draw border
+                draw.rectangle([28, 103, 172, 287], outline=primary_color, width=3)
+            except Exception as e:
+                logger.error(f"Photo paste error: {e}")
+                draw.rectangle([30, 105, 170, 285], outline=primary_color, width=3)
+                draw.text((70, 180), "PHOTO", fill="#888888", font=font_medium)
+        else:
+            draw.rectangle([30, 105, 170, 285], outline=primary_color, width=3)
+            draw.text((70, 180), "PHOTO", fill="#888888", font=font_medium)
+        
+        # Draw user details
+        y_start = 115
+        details = [
+            ("Full Name:", user_data.get("full_name", "John Doe")),
+            ("Date of Birth:", user_data.get("date_of_birth", "01/01/1990")),
+            ("Gender:", user_data.get("gender", "Male")),
+            ("Phone:", user_data.get("phone", "+234 800 000 0000")),
+            ("Email:", user_data.get("email", "john@example.com")),
+            ("Address:", user_data.get("address", "Lagos, Nigeria")),
+            ("Issue Date:", datetime.now().strftime("%d/%m/%Y")),
+            ("Expiry Date:", (datetime.now() + timedelta(days=365*5)).strftime("%d/%m/%Y")),
         ]
         
-        for label, value in labels:
-            draw.text((180, y_start), label, fill="#666666", font=font_small)
-            draw.text((280, y_start), value, fill="#333333", font=font_medium)
-            y_start += 30
+        for label, value in details:
+            draw.text((190, y_start), label, fill="#666666", font=font_small)
+            draw.text((290, y_start), value, fill="#333333", font=font_medium)
+            y_start += 28
         
-        # Draw barcode placeholder
-        for i in range(300, 550, 4):
-            height_bar = random.randint(10, 30)
-            draw.rectangle([i, 330, i + 2, 330 + height_bar], fill="#000000")
+        # Draw barcode
+        for i in range(300, 560, 3):
+            height_bar = random.randint(15, 35)
+            draw.rectangle([i, 340, i + 2, 340 + height_bar], fill="#000000")
         
         # Draw footer
-        draw.text((20, height - 30), "Valid ID - Official Document", fill="#999999", font=font_small)
-        draw.text((width - 200, height - 30), "www.identity.gov", fill="#999999", font=font_small)
+        draw.text((30, height - 25), "This is an official document. Any alteration is punishable by law.", 
+                 fill="#999999", font=font_small)
+        draw.text((width - 180, height - 25), "www.nimc.gov.ng", fill="#999999", font=font_small)
         
-        # Convert to bytes
         img_bytes = io.BytesIO()
         img.save(img_bytes, format='PNG')
         img_bytes.seek(0)
@@ -272,18 +281,90 @@ def generate_id_card(data: Dict = None) -> bytes:
         logger.error(f"ID generation error: {e}")
         return None
 
-def generate_drivers_license(data: Dict = None) -> bytes:
-    """Generate a driver's license image"""
-    if data is None:
-        data = {
-            "full_name": "Jane Smith",
-            "license_number": f"DL-{random.randint(100000, 999999)}",
-            "vehicle_class": "B",
-            "issue_date": datetime.now().strftime("%d/%m/%Y"),
-            "expiry_date": (datetime.now() + timedelta(days=365*3)).strftime("%d/%m/%Y"),
-            "color": "blue",
-        }
-    
+def generate_nin_with_photo(user_data: Dict, photo_data: bytes = None) -> bytes:
+    """Generate a realistic NIN card with user photo"""
+    try:
+        width, height = 500, 380
+        img = Image.new('RGB', (width, height), color='#FFFFFF')
+        draw = ImageDraw.Draw(img)
+        
+        try:
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+            font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        except:
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+            font_bold = ImageFont.load_default()
+        
+        # Official NIN colors
+        primary_color = "#1a237e"
+        secondary_color = "#0d47a1"
+        accent_color = "#FFD700"
+        
+        # Draw header
+        draw.rectangle([0, 0, width, 60], fill=primary_color)
+        draw.text((width//2 - 90, 10), "NATIONAL IDENTIFICATION", fill="#FFFFFF", font=font_large)
+        draw.text((width//2 - 70, 35), "NUMBER (NIN)", fill=accent_color, font=font_medium)
+        
+        # Draw NIN number
+        nin_number = user_data.get("nin", f"{random.randint(10000000000, 99999999999)}")
+        draw.text((width//2 - 80, 80), nin_number, fill="#000000", font=font_large)
+        
+        # Draw photo
+        if photo_data:
+            try:
+                photo = Image.open(io.BytesIO(photo_data))
+                photo = photo.resize((100, 120), Image.Resampling.LANCZOS)
+                img.paste(photo, (30, 100))
+                draw.rectangle([28, 98, 132, 222], outline=primary_color, width=2)
+            except:
+                draw.rectangle([30, 100, 130, 220], outline=primary_color, width=2)
+                draw.text((60, 150), "PHOTO", fill="#888888", font=font_medium)
+        else:
+            draw.rectangle([30, 100, 130, 220], outline=primary_color, width=2)
+            draw.text((60, 150), "PHOTO", fill="#888888", font=font_medium)
+        
+        # Draw user details
+        y_start = 110
+        details = [
+            (f"Name: {user_data.get('full_name', 'John Doe')}"),
+            (f"Date of Birth: {user_data.get('date_of_birth', '01/01/1990')}"),
+            (f"State of Origin: {user_data.get('state_of_origin', 'Lagos')}"),
+            (f"Registration: {datetime.now().strftime('%d/%m/%Y')}"),
+            (f"Expiry: {(datetime.now() + timedelta(days=365*10)).strftime('%d/%m/%Y')}"),
+        ]
+        
+        x_start = 150
+        for detail in details:
+            draw.text((x_start, y_start), detail, fill="#333333", font=font_medium)
+            y_start += 30
+        
+        # Draw barcode
+        for i in range(50, 470, 3):
+            draw.rectangle([i, 330, i + 2, 350], fill="#000000")
+        
+        # Draw footer
+        draw.text((20, height - 25), "Official NIN Document - Verified", fill="#666666", font=font_small)
+        draw.text((width - 170, height - 25), "www.nimc.gov.ng", fill="#666666", font=font_small)
+        
+        # Security seal
+        draw.ellipse([width - 70, 10, width - 20, 60], outline="#FFD700", width=2)
+        draw.text((width - 55, 30), "NIN", fill="#FFD700", font=font_small)
+        
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        return img_bytes.getvalue()
+        
+    except Exception as e:
+        logger.error(f"NIN generation error: {e}")
+        return None
+
+def generate_drivers_license_with_photo(user_data: Dict, photo_data: bytes = None) -> bytes:
+    """Generate a realistic driver's license with photo"""
     try:
         width, height = 600, 400
         img = Image.new('RGB', (width, height), color='#FFFFFF')
@@ -293,61 +374,65 @@ def generate_drivers_license(data: Dict = None) -> bytes:
             font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
             font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
             font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
         except:
             font_large = ImageFont.load_default()
             font_medium = ImageFont.load_default()
             font_small = ImageFont.load_default()
+            font_bold = ImageFont.load_default()
         
-        # Color schemes
-        colors = {
-            "blue": ("#1565c0", "#e3f2fd"),
-            "green": ("#2e7d32", "#e8f5e9"),
-            "red": ("#c62828", "#ffebee"),
-            "purple": ("#6a1b9a", "#f3e5f5"),
-            "orange": ("#e65100", "#fff3e0"),
-            "black": ("#263238", "#eceff1"),
-        }
+        # Official colors
+        primary_color = "#1b5e20"
+        secondary_color = "#2e7d32"
+        accent_color = "#FFD700"
         
-        primary_color, bg_color = colors.get(data.get("color", "blue"), colors["blue"])
-        
-        # Draw background
-        draw.rectangle([0, 0, width, height], fill=bg_color)
-        
-        # Draw header
+        draw.rectangle([0, 0, width, height], fill="#f5f5f5")
         draw.rectangle([0, 0, width, 80], fill=primary_color)
-        draw.text((20, 20), "DRIVER'S LICENSE", fill="#FFFFFF", font=font_large)
+        draw.rectangle([0, 80, width, 85], fill=secondary_color)
         
-        # Draw state emblem placeholder
-        draw.rectangle([width - 120, 10, width - 20, 70], outline="#FFFFFF", width=2)
-        draw.text((width - 100, 35), "STATE", fill="#FFFFFF", font=font_small)
+        draw.text((20, 20), "FEDERAL REPUBLIC OF NIGERIA", fill="#FFFFFF", font=font_small)
+        draw.text((20, 45), "DRIVER'S LICENSE", fill="#FFD700", font=font_large)
         
-        # Draw photo placeholder
-        draw.rectangle([30, 100, 150, 280], outline=primary_color, width=2)
-        draw.text((60, 180), "PHOTO", fill="#888888", font=font_medium)
+        license_number = user_data.get("license_number", f"DL-{random.randint(100000, 999999)}")
+        draw.text((width - 220, 30), f"License: {license_number}", fill="#FFFFFF", font=font_bold)
         
-        # Draw details
+        # Draw photo
+        if photo_data:
+            try:
+                photo = Image.open(io.BytesIO(photo_data))
+                photo = photo.resize((140, 180), Image.Resampling.LANCZOS)
+                img.paste(photo, (30, 100))
+                draw.rectangle([28, 98, 172, 282], outline=primary_color, width=3)
+            except:
+                draw.rectangle([30, 100, 170, 280], outline=primary_color, width=3)
+                draw.text((70, 180), "PHOTO", fill="#888888", font=font_medium)
+        else:
+            draw.rectangle([30, 100, 170, 280], outline=primary_color, width=3)
+            draw.text((70, 180), "PHOTO", fill="#888888", font=font_medium)
+        
+        # Draw user details
         y_start = 110
-        labels = [
-            ("Name:", data.get("full_name", "Jane Smith")),
-            ("License #:", data.get("license_number", "DL-123456")),
-            ("Class:", data.get("vehicle_class", "B")),
-            ("Issue Date:", data.get("issue_date", "01/01/2024")),
-            ("Expiry Date:", data.get("expiry_date", "01/01/2027")),
+        details = [
+            ("Name:", user_data.get("full_name", "Jane Smith")),
+            ("Date of Birth:", user_data.get("date_of_birth", "01/01/1990")),
+            ("Vehicle Class:", random.choice(["A", "B", "C", "D", "E"])),
+            ("Address:", user_data.get("address", "Lagos, Nigeria")),
+            ("Issue Date:", datetime.now().strftime("%d/%m/%Y")),
+            ("Expiry Date:", (datetime.now() + timedelta(days=365*3)).strftime("%d/%m/%Y")),
         ]
         
-        for label, value in labels:
-            draw.text((180, y_start), label, fill="#666666", font=font_small)
-            draw.text((280, y_start), value, fill="#333333", font=font_medium)
-            y_start += 35
+        for label, value in details:
+            draw.text((190, y_start), label, fill="#666666", font=font_small)
+            draw.text((290, y_start), value, fill="#333333", font=font_medium)
+            y_start += 28
         
         # Draw barcode
-        for i in range(300, 550, 3):
+        for i in range(300, 560, 3):
             height_bar = random.randint(15, 35)
-            draw.rectangle([i, 350, i + 2, 350 + height_bar], fill="#000000")
+            draw.rectangle([i, 340, i + 2, 340 + height_bar], fill="#000000")
         
-        # Draw footer
-        draw.text((20, height - 30), "Driver License - Official Document", fill="#999999", font=font_small)
-        draw.text((width - 200, height - 30), "www.dmv.gov", fill="#999999", font=font_small)
+        draw.text((20, height - 25), "Driver License - Official Document", fill="#999999", font=font_small)
+        draw.text((width - 200, height - 25), "www.dmv.gov.ng", fill="#999999", font=font_small)
         
         img_bytes = io.BytesIO()
         img.save(img_bytes, format='PNG')
@@ -358,295 +443,6 @@ def generate_drivers_license(data: Dict = None) -> bytes:
         logger.error(f"License generation error: {e}")
         return None
 
-def generate_nin_image(nin_data: Dict) -> bytes:
-    """Generate a NIN card image"""
-    try:
-        width, height = 400, 250
-        img = Image.new('RGB', (width, height), color='#FFFFFF')
-        draw = ImageDraw.Draw(img)
-        
-        try:
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        except:
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-        
-        # Draw header
-        draw.rectangle([0, 0, width, 50], fill="#1a237e")
-        draw.text((width//2 - 60, 15), "NATIONAL IDENTIFICATION", fill="#FFFFFF", font=font_large)
-        draw.text((width//2 - 40, 35), "NUMBER (NIN)", fill="#FFD700", font=font_medium)
-        
-        # Draw NIN number prominently
-        nin_number = nin_data.get("number", "12345678901")
-        draw.text((width//2 - 80, 70), nin_number, fill="#000000", font=font_large)
-        
-        # Draw details
-        y_start = 120
-        details = [
-            (f"State: {nin_data.get('state', 'Lagos')}"),
-            (f"Birth Date: {nin_data.get('birth_date', '01/01/1990')}"),
-            (f"Issue Date: {nin_data.get('issue_date', '01/01/2024')}"),
-            (f"Expiry Date: {nin_data.get('expiry_date', '01/01/2029')}"),
-        ]
-        
-        for detail in details:
-            draw.text((20, y_start), detail, fill="#333333", font=font_small)
-            y_start += 25
-        
-        # Draw barcode
-        for i in range(50, 350, 3):
-            draw.rectangle([i, 210, i + 2, 230], fill="#000000")
-        
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-        
-    except Exception as e:
-        logger.error(f"NIN image error: {e}")
-        return None
-
-def generate_passport(data: Dict = None) -> bytes:
-    """Generate a passport document image"""
-    if data is None:
-        data = {
-            "full_name": "Michael Johnson",
-            "passport_number": f"PP-{random.randint(100000, 999999)}",
-            "nationality": "Nigerian",
-            "issue_date": datetime.now().strftime("%d/%m/%Y"),
-            "expiry_date": (datetime.now() + timedelta(days=365*5)).strftime("%d/%m/%Y"),
-            "color": "blue",
-        }
-    
-    try:
-        width, height = 600, 400
-        img = Image.new('RGB', (width, height), color='#FFFFFF')
-        draw = ImageDraw.Draw(img)
-        
-        try:
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-        except:
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-        
-        colors = {
-            "blue": ("#0d47a1", "#e3f2fd"),
-            "green": ("#1b5e20", "#e8f5e9"),
-            "red": ("#b71c1c", "#ffebee"),
-            "purple": ("#4a148c", "#f3e5f5"),
-            "orange": ("#bf360c", "#fff3e0"),
-            "black": ("#1a1a2e", "#eceff1"),
-        }
-        
-        primary_color, bg_color = colors.get(data.get("color", "blue"), colors["blue"])
-        
-        draw.rectangle([0, 0, width, height], fill=bg_color)
-        draw.rectangle([0, 0, width, 80], fill=primary_color)
-        draw.text((20, 20), "PASSPORT", fill="#FFFFFF", font=font_large)
-        
-        draw.rectangle([30, 100, 150, 280], outline=primary_color, width=2)
-        draw.text((60, 180), "PHOTO", fill="#888888", font=font_medium)
-        
-        y_start = 110
-        labels = [
-            ("Name:", data.get("full_name", "Michael Johnson")),
-            ("Passport #:", data.get("passport_number", "PP-123456")),
-            ("Nationality:", data.get("nationality", "Nigerian")),
-            ("Issue Date:", data.get("issue_date", "01/01/2024")),
-            ("Expiry Date:", data.get("expiry_date", "01/01/2029")),
-        ]
-        
-        for label, value in labels:
-            draw.text((180, y_start), label, fill="#666666", font=font_small)
-            draw.text((280, y_start), value, fill="#333333", font=font_medium)
-            y_start += 35
-        
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-        
-    except Exception as e:
-        logger.error(f"Passport generation error: {e}")
-        return None
-
-def generate_voter_id(data: Dict = None) -> bytes:
-    """Generate a voter ID card image"""
-    if data is None:
-        data = {
-            "full_name": "David Williams",
-            "voter_id": f"VID-{random.randint(100000, 999999)}",
-            "constituency": "Lagos Central",
-            "issue_date": datetime.now().strftime("%d/%m/%Y"),
-            "color": "green",
-        }
-    
-    try:
-        width, height = 500, 320
-        img = Image.new('RGB', (width, height), color='#FFFFFF')
-        draw = ImageDraw.Draw(img)
-        
-        try:
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        except:
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-        
-        primary_color = "#1b5e20"
-        draw.rectangle([0, 0, width, 60], fill=primary_color)
-        draw.text((width//2 - 70, 15), "VOTER ID CARD", fill="#FFFFFF", font=font_large)
-        
-        y_start = 80
-        labels = [
-            ("Name:", data.get("full_name", "David Williams")),
-            ("Voter ID:", data.get("voter_id", "VID-123456")),
-            ("Constituency:", data.get("constituency", "Lagos Central")),
-            ("Issue Date:", data.get("issue_date", "01/01/2024")),
-        ]
-        
-        for label, value in labels:
-            draw.text((30, y_start), label, fill="#666666", font=font_small)
-            draw.text((150, y_start), value, fill="#333333", font=font_medium)
-            y_start += 35
-        
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-        
-    except Exception as e:
-        logger.error(f"Voter ID error: {e}")
-        return None
-
-def generate_student_id(data: Dict = None) -> bytes:
-    """Generate a student ID card image"""
-    if data is None:
-        data = {
-            "full_name": "Emma Okonkwo",
-            "student_id": f"SID-{random.randint(100000, 999999)}",
-            "course": "Computer Science",
-            "university": "University of Lagos",
-            "issue_date": datetime.now().strftime("%d/%m/%Y"),
-            "color": "purple",
-        }
-    
-    try:
-        width, height = 500, 320
-        img = Image.new('RGB', (width, height), color='#FFFFFF')
-        draw = ImageDraw.Draw(img)
-        
-        try:
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        except:
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-        
-        primary_color = "#6a1b9a"
-        draw.rectangle([0, 0, width, 60], fill=primary_color)
-        draw.text((width//2 - 60, 15), "STUDENT ID CARD", fill="#FFFFFF", font=font_large)
-        
-        y_start = 80
-        labels = [
-            ("Name:", data.get("full_name", "Emma Okonkwo")),
-            ("Student ID:", data.get("student_id", "SID-123456")),
-            ("Course:", data.get("course", "Computer Science")),
-            ("University:", data.get("university", "University of Lagos")),
-            ("Issue Date:", data.get("issue_date", "01/01/2024")),
-        ]
-        
-        for label, value in labels:
-            draw.text((30, y_start), label, fill="#666666", font=font_small)
-            draw.text((150, y_start), value, fill="#333333", font=font_medium)
-            y_start += 30
-        
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-        
-    except Exception as e:
-        logger.error(f"Student ID error: {e}")
-        return None
-
-def validate_id_number(number: str, doc_type: str) -> Dict:
-    """Validate an ID number format"""
-    result = {"valid": False, "message": "", "type": doc_type}
-    
-    if doc_type == "nin":
-        if len(number) == 11 and number.isdigit():
-            result["valid"] = True
-            result["message"] = "✅ Valid NIN format (11 digits)"
-        else:
-            result["message"] = "❌ Invalid NIN format. Must be 11 digits."
-    
-    elif doc_type == "id_card":
-        if re.match(r'ID-\d{4}-\d{3}', number):
-            result["valid"] = True
-            result["message"] = "✅ Valid ID Card format"
-        else:
-            result["message"] = "❌ Invalid ID Card format. Use: ID-YYYY-XXX"
-    
-    elif doc_type == "drivers_license":
-        if re.match(r'DL-\d{6}', number):
-            result["valid"] = True
-            result["message"] = "✅ Valid Driver's License format"
-        else:
-            result["message"] = "❌ Invalid License format. Use: DL-XXXXXX"
-    
-    elif doc_type == "passport":
-        if re.match(r'PP-\d{6}', number):
-            result["valid"] = True
-            result["message"] = "✅ Valid Passport format"
-        else:
-            result["message"] = "❌ Invalid Passport format. Use: PP-XXXXXX"
-    
-    else:
-        result["message"] = "❌ Unknown document type"
-    
-    return result
-
-def convert_document(data: str, from_type: str, to_type: str) -> Dict:
-    """Convert document data between formats"""
-    # This is a simplified conversion - in production, you'd use actual conversion logic
-    result = {
-        "success": False,
-        "converted_data": "",
-        "message": ""
-    }
-    
-    try:
-        if from_type == "nin" and to_type == "id":
-            # Convert NIN to ID format
-            result["converted_data"] = f"ID-{data[:4]}-{data[4:7]}"
-            result["success"] = True
-            result["message"] = "✅ Converted NIN to ID Card format"
-        elif from_type == "id" and to_type == "nin":
-            # Convert ID to NIN format
-            import re
-            match = re.search(r'ID-(\d{4})-(\d{3})', data)
-            if match:
-                result["converted_data"] = f"{match.group(1)}{match.group(2)}0000"
-                result["success"] = True
-                result["message"] = "✅ Converted ID Card to NIN format"
-        else:
-            result["message"] = "❌ Conversion not supported for these types"
-    except Exception as e:
-        result["message"] = f"❌ Conversion error: {str(e)}"
-    
-    return result
-
 # ==================== COMMAND HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -656,20 +452,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = get_user_data(user_id)
     
     welcome = (
-        f"📋 **Welcome to {BOT_NAME}!**\n\n"
+        f"🔐 **Welcome to {BOT_NAME}!**\n\n"
         f"👋 Hello @{user.username or user.first_name}!\n\n"
-        f"Your professional identity document generator.\n\n"
+        f"Your professional identity verification and document generator.\n\n"
         f"⚡ **Features:**\n"
-        f"• 🪪 ID Card Generator\n"
-        f"• 🔢 NIN Generator & Validator\n"
-        f"• 🚗 Driver's License Generator\n"
-        f"• 🛂 Passport Generator\n"
-        f"• 🗳️ Voter ID Generator\n"
-        f"• 🎓 Student ID Generator\n"
-        f"• 🔄 Document Converter\n"
-        f"• ✅ Document Validator\n\n"
-        f"📊 **Your Stats:**\n"
-        f"• Total documents generated: {data['total_generated']}\n\n"
+        f"• 📝 Complete Registration\n"
+        f"• 📸 Photo Upload for ID\n"
+        f"• 🪪 ID Card Generation\n"
+        f"• 🔢 NIN Generation\n"
+        f"• 🚗 Driver's License\n"
+        f"• ✅ Verification Status\n"
+        f"• 🔒 Data Privacy & Consent\n\n"
+        f"📊 **Your Status:** {data.get('status', 'Pending').upper()}\n\n"
         f"⬇️ Use the buttons below to get started!"
     )
     
@@ -683,22 +477,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     help_text = (
         f"📖 **{BOT_NAME} User Guide**\n\n"
-        "**📋 Document Types:**\n"
-        "• 🪪 ID Card - Employee/Company ID\n"
-        "• 🔢 NIN - National Identification Number\n"
-        "• 🚗 Driver's License - Driving permit\n"
-        "• 🛂 Passport - International travel document\n"
-        "• 🗳️ Voter ID - Voting identification\n"
-        "• 🎓 Student ID - Academic identification\n\n"
-        "**🔧 Features:**\n"
-        "• Generate any document type\n"
-        "• Validate document numbers\n"
-        "• Convert between formats\n"
-        "• Customize colors\n\n"
+        "**📝 Registration Process:**\n"
+        "1. Click 'Start Registration'\n"
+        "2. Fill in your personal information\n"
+        "3. Upload your photo\n"
+        "4. Provide consent\n"
+        "5. Get verified!\n\n"
+        "**📸 Photo Requirements:**\n"
+        "• Clear, front-facing photo\n"
+        "• Good lighting\n"
+        "• White background preferred\n"
+        "• JPEG or PNG format\n\n"
+        "**🪪 Documents Available:**\n"
+        "• National ID Card\n"
+        "• NIN Card\n"
+        "• Driver's License\n"
+        "• Passport\n\n"
+        "**🔒 Privacy:**\n"
+        "• Your data is encrypted\n"
+        "• You can delete your data anytime\n"
+        "• We never share your information\n\n"
         "**📌 Commands:**\n"
         "/start - Main menu\n"
         "/help - This help\n"
-        "/stats - Your statistics"
+        "/register - Start registration"
     )
     
     await update.message.reply_text(
@@ -707,397 +509,508 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard()
     )
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command"""
+# ==================== REGISTRATION CONVERSATION ====================
+
+async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start registration process"""
     user_id = str(update.effective_user.id)
     data = get_user_data(user_id)
     
-    # Count document types
-    doc_counts = {}
-    for entry in data.get("history", []):
-        doc_type = entry.get("type", "unknown")
-        doc_counts[doc_type] = doc_counts.get(doc_type, 0) + 1
-    
-    stats_text = (
-        f"📊 **Your Statistics**\n\n"
-        f"📋 Total documents: {data['total_generated']}\n"
-        f"📅 Account active since: {datetime.now().strftime('%Y-%m-%d')}\n\n"
-    )
-    
-    if doc_counts:
-        stats_text += "📈 **Document Types:**\n"
-        for doc_type, count in doc_counts.items():
-            doc_name = DOCUMENT_TYPES.get(doc_type, {}).get("name", doc_type)
-            stats_text += f"• {doc_name}: {count}\n"
+    if data.get("status") == "verified":
+        await update.message.reply_text(
+            "✅ You are already verified!\n\n"
+            "You can generate documents using the buttons below.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
     
     await update.message.reply_text(
-        stats_text,
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        "📝 **Registration Started!**\n\n"
+        "Please enter your **Full Legal Name**:\n"
+        "(e.g., John Oluwaseun Adebayo)",
+        parse_mode="Markdown"
     )
+    return NAME
 
-# ==================== CALLBACK HANDLERS ====================
+async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle name input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    data["personal_info"]["full_name"] = update.message.text
+    
+    await update.message.reply_text(
+        "📅 **Enter your Date of Birth:**\n"
+        "(Format: DD/MM/YYYY)\n"
+        "e.g., 15/08/1990",
+        parse_mode="Markdown"
+    )
+    return DOB
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses"""
+async def register_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle date of birth input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    
+    # Validate date format
+    dob = update.message.text
+    if not re.match(r'\d{2}/\d{2}/\d{4}', dob):
+        await update.message.reply_text(
+            "❌ Invalid format. Please use DD/MM/YYYY\n"
+            "e.g., 15/08/1990"
+        )
+        return DOB
+    
+    data["personal_info"]["date_of_birth"] = dob
+    
+    keyboard = [
+        [InlineKeyboardButton("Male", callback_data="gender_male"),
+         InlineKeyboardButton("Female", callback_data="gender_female")],
+        [InlineKeyboardButton("Other", callback_data="gender_other")]
+    ]
+    await update.message.reply_text(
+        "👤 **Select your Gender:**",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return GENDER
+
+async def register_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle gender selection"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    gender = query.data.replace("gender_", "")
+    data["personal_info"]["gender"] = gender.capitalize()
+    
+    await query.edit_message_text(
+        "📱 **Enter your Phone Number:**\n"
+        "(Include country code)\n"
+        "e.g., +234 800 000 0000",
+        parse_mode="Markdown"
+    )
+    return PHONE
+
+async def register_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle phone input"""
     user_id = str(update.effective_user.id)
     data = get_user_data(user_id)
-    action = query.data
+    data["personal_info"]["phone"] = update.message.text
     
-    # ===== DOCUMENT GENERATION =====
+    await update.message.reply_text(
+        "📧 **Enter your Email Address:**\n"
+        "e.g., john@example.com",
+        parse_mode="Markdown"
+    )
+    return EMAIL
+
+async def register_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle email input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    data["personal_info"]["email"] = update.message.text
     
-    if action.startswith("gen_"):
-        doc_type = action.replace("gen_", "")
+    await update.message.reply_text(
+        "🌍 **Enter your Country:**\n"
+        "e.g., Nigeria",
+        parse_mode="Markdown"
+    )
+    return COUNTRY
+
+async def register_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle country input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    data["personal_info"]["country"] = update.message.text
+    
+    await update.message.reply_text(
+        "📍 **Enter your Address:**\n"
+        "e.g., 42, Allen Avenue, Ikeja, Lagos",
+        parse_mode="Markdown"
+    )
+    return ADDRESS
+
+async def register_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle address input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    data["personal_info"]["address"] = update.message.text
+    
+    keyboard = [
+        [InlineKeyboardButton("🪪 National ID", callback_data="id_type_national_id")],
+        [InlineKeyboardButton("🛂 Passport", callback_data="id_type_passport")],
+        [InlineKeyboardButton("🚗 Driver's License", callback_data="id_type_drivers_license")],
+        [InlineKeyboardButton("🔢 NIN", callback_data="id_type_nin")]
+    ]
+    await update.message.reply_text(
+        "🪪 **Select ID Type:**",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ID_TYPE
+
+async def register_id_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ID type selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    id_type = query.data.replace("id_type_", "")
+    data["verification"]["id_type"] = id_type
+    
+    await query.edit_message_text(
+        f"📝 **Enter your {id_type.replace('_', ' ').title()} Number:**\n"
+        f"e.g., NID-2024-001",
+        parse_mode="Markdown"
+    )
+    return ID_NUMBER
+
+async def register_id_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ID number input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    data["verification"]["id_number"] = update.message.text
+    
+    await update.message.reply_text(
+        "🔢 **Enter your NIN (National Identification Number):**\n"
+        "e.g., 12345678901\n\n"
+        "Skip if not applicable: type 'skip'",
+        parse_mode="Markdown"
+    )
+    return NIN
+
+async def register_nin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle NIN input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    
+    nin = update.message.text
+    if nin.lower() != "skip":
+        data["verification"]["nin"] = nin
+    
+    await update.message.reply_text(
+        "🏦 **Enter your BVN (Bank Verification Number):**\n"
+        "e.g., 12345678901\n\n"
+        "Skip if not applicable: type 'skip'",
+        parse_mode="Markdown"
+    )
+    return BVN
+
+async def register_bvn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle BVN input"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    
+    bvn = update.message.text
+    if bvn.lower() != "skip":
+        data["verification"]["bvn"] = bvn
+    
+    # Show consent
+    await update.message.reply_text(
+        "🔒 **Privacy & Consent**\n\n"
+        "I confirm that the information provided is accurate.\n"
+        "I consent to the processing of my data for identity verification.\n\n"
+        "Please review our Privacy Policy:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Consent", callback_data="consent_yes")],
+            [InlineKeyboardButton("📄 Privacy Policy", callback_data="privacy_policy")],
+            [InlineKeyboardButton("❌ I Do Not Consent", callback_data="consent_no")]
+        ])
+    )
+    return CONSENT
+
+async def register_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle consent"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    if query.data == "consent_yes":
+        data["consent"]["given"] = True
+        data["consent"]["date"] = datetime.now().isoformat()
+        data["status"] = "pending_verification"
         
-        # Generate document based on type
-        if doc_type == "id_card" or doc_type == "id":
-            doc_data = {
-                "full_name": "John Doe",
-                "id_number": f"ID-{datetime.now().year}-{random.randint(100, 999)}",
-                "department": "Technology",
-                "role": "Software Engineer",
-                "issue_date": datetime.now().strftime("%d/%m/%Y"),
-                "expiry_date": (datetime.now() + timedelta(days=365*2)).strftime("%d/%m/%Y"),
-                "color": data["settings"].get("color_scheme", "blue"),
-            }
-            img_data = generate_id_card(doc_data)
-            caption = f"🪪 **ID Card Generated!**\n\nName: {doc_data['full_name']}\nID: {doc_data['id_number']}\nDepartment: {doc_data['department']}"
-            
-        elif doc_type == "nin":
-            nin_data = generate_nin()
-            img_data = generate_nin_image(nin_data)
-            caption = f"🔢 **NIN Generated!**\n\nNIN: {nin_data['number']}\nState: {nin_data['state']}\nBirth: {nin_data['birth_date']}"
-            
-        elif doc_type == "drivers_license":
-            doc_data = {
-                "full_name": "Jane Smith",
-                "license_number": f"DL-{random.randint(100000, 999999)}",
-                "vehicle_class": random.choice(["A", "B", "C", "D"]),
-                "issue_date": datetime.now().strftime("%d/%m/%Y"),
-                "expiry_date": (datetime.now() + timedelta(days=365*3)).strftime("%d/%m/%Y"),
-                "color": data["settings"].get("color_scheme", "blue"),
-            }
-            img_data = generate_drivers_license(doc_data)
-            caption = f"🚗 **Driver's License Generated!**\n\nName: {doc_data['full_name']}\nLicense: {doc_data['license_number']}\nClass: {doc_data['vehicle_class']}"
-            
-        elif doc_type == "passport":
-            doc_data = {
-                "full_name": "Michael Johnson",
-                "passport_number": f"PP-{random.randint(100000, 999999)}",
-                "nationality": "Nigerian",
-                "issue_date": datetime.now().strftime("%d/%m/%Y"),
-                "expiry_date": (datetime.now() + timedelta(days=365*5)).strftime("%d/%m/%Y"),
-                "color": data["settings"].get("color_scheme", "blue"),
-            }
-            img_data = generate_passport(doc_data)
-            caption = f"🛂 **Passport Generated!**\n\nName: {doc_data['full_name']}\nPassport: {doc_data['passport_number']}\nNationality: {doc_data['nationality']}"
-            
-        elif doc_type == "voter_id":
-            doc_data = {
-                "full_name": "David Williams",
-                "voter_id": f"VID-{random.randint(100000, 999999)}",
-                "constituency": random.choice(["Lagos Central", "Abuja", "Kano", "Port Harcourt"]),
-                "issue_date": datetime.now().strftime("%d/%m/%Y"),
-                "color": data["settings"].get("color_scheme", "green"),
-            }
-            img_data = generate_voter_id(doc_data)
-            caption = f"🗳️ **Voter ID Generated!**\n\nName: {doc_data['full_name']}\nID: {doc_data['voter_id']}\nConstituency: {doc_data['constituency']}"
-            
-        elif doc_type == "student_id":
-            doc_data = {
-                "full_name": "Emma Okonkwo",
-                "student_id": f"SID-{random.randint(100000, 999999)}",
-                "course": random.choice(["Computer Science", "Engineering", "Medicine", "Law"]),
-                "university": random.choice(["University of Lagos", "UNN", "OAU", "ABU"]),
-                "issue_date": datetime.now().strftime("%d/%m/%Y"),
-                "color": data["settings"].get("color_scheme", "purple"),
-            }
-            img_data = generate_student_id(doc_data)
-            caption = f"🎓 **Student ID Generated!**\n\nName: {doc_data['full_name']}\nID: {doc_data['student_id']}\nCourse: {doc_data['course']}"
-            
-        else:
-            await query.edit_message_text(
-                "❌ Unknown document type.",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-            return
+        # Generate ID number
+        data["id_number"] = f"NID-{datetime.now().year}-{random.randint(100, 999)}"
         
-        if img_data:
-            data["total_generated"] += 1
-            data["history"].append({
-                "type": doc_type,
-                "timestamp": datetime.now().isoformat()
+        await query.edit_message_text(
+            "✅ **Registration Complete!**\n\n"
+            "Thank you for registering. Your information has been received.\n\n"
+            "📸 **Next Step:** Upload your photo for ID card generation.\n\n"
+            "Click 'Upload Photo' to add your picture.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Upload Photo", callback_data="upload_photo")],
+                [InlineKeyboardButton("🪪 Generate ID", callback_data="gen_id")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="back")]
+            ])
+        )
+        
+    elif query.data == "consent_no":
+        data["consent"]["given"] = False
+        await query.edit_message_text(
+            "❌ **Consent Required**\n\n"
+            "You must provide consent to proceed with registration.\n\n"
+            "If you change your mind, please start over.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+        
+    elif query.data == "privacy_policy":
+        await query.edit_message_text(
+            "📄 **Privacy Policy**\n\n"
+            "1. We collect personal data for identity verification only.\n"
+            "2. Your data is encrypted and stored securely.\n"
+            "3. We do not share your data with third parties.\n"
+            "4. You can request data deletion anytime.\n"
+            "5. You have the right to access your data.\n\n"
+            "Do you consent to these terms?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Consent", callback_data="consent_yes")],
+                [InlineKeyboardButton("❌ I Do Not Consent", callback_data="consent_no")]
+            ])
+        )
+        return CONSENT
+    
+    return ConversationHandler.END
+
+# ==================== PHOTO UPLOAD HANDLERS ====================
+
+async def upload_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start photo upload process"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "📸 **Photo Upload**\n\n"
+        "Please send me a clear photo.\n\n"
+        "**Requirements:**\n"
+        "• Front-facing photo\n"
+        "• Good lighting\n"
+        "• White background preferred\n"
+        "• JPEG or PNG format\n\n"
+        "Send /cancel to cancel.",
+        parse_mode="Markdown"
+    )
+    return PHOTO_UPLOAD
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo upload"""
+    user_id = str(update.effective_user.id)
+    data = get_user_data(user_id)
+    
+    try:
+        # Get photo
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        photo_data = await file.download_as_bytearray()
+        
+        # Process and store photo
+        processed_photo = resize_and_crop_image(photo_data, (140, 180))
+        
+        if processed_photo:
+            # Store photo data in user_data
+            if "photos" not in data:
+                data["photos"] = []
+            data["photos"].append({
+                "file_id": photo.file_id,
+                "processed": processed_photo,
+                "uploaded_at": datetime.now().isoformat()
             })
+            data["status"] = "photo_uploaded"
             
-            await query.message.reply_photo(
-                photo=io.BytesIO(img_data),
-                caption=caption,
+            await update.message.reply_text(
+                "✅ **Photo Uploaded Successfully!**\n\n"
+                "Your photo has been saved. You can now:\n"
+                "• Generate ID Card with your photo\n"
+                "• Generate NIN with your photo\n"
+                "• View your photo",
                 parse_mode="Markdown",
-                reply_markup=get_document_options_keyboard(doc_type)
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🪪 Generate ID", callback_data="gen_id")],
+                    [InlineKeyboardButton("🔢 Generate NIN", callback_data="gen_nin")],
+                    [InlineKeyboardButton("📸 View Photo", callback_data="view_photo")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="back")]
+                ])
             )
         else:
-            await query.message.reply_text(
-                "❌ Failed to generate document. Please try again.",
-                reply_markup=get_main_keyboard()
+            await update.message.reply_text(
+                "❌ **Photo Processing Failed**\n\n"
+                "Please try again with a different photo.",
+                parse_mode="Markdown"
             )
             
-        await query.delete_message()
-        
-    # ===== ALL DOCUMENTS =====
-    
-    elif action == "all_docs":
-        await query.edit_message_text(
-            "📋 **All Document Types**\n\n"
-            "Select a document type to generate:",
-            parse_mode="Markdown",
-            reply_markup=get_document_keyboard()
-        )
-        
-    # ===== DOCUMENT SELECTION =====
-    
-    elif action.startswith("doc_"):
-        doc_type = action.replace("doc_", "")
-        await generate_document(query, doc_type, data)
-        
-    # ===== CONVERT DOCUMENT =====
-    
-    elif action == "convert_doc":
-        await query.edit_message_text(
-            "🔄 **Document Converter**\n\n"
-            "Send me a document number to convert.\n\n"
-            "Examples:\n"
-            "• NIN: `12345678901`\n"
-            "• ID Card: `ID-2024-001`\n"
-            "• License: `DL-123456`\n\n"
-            "I'll try to convert it to another format.\n\n"
-            "Send /cancel to cancel.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        context.user_data["action"] = "convert_doc"
-        
-    # ===== VALIDATE DOCUMENT =====
-    
-    elif action == "validate_doc":
-        await query.edit_message_text(
-            "✅ **Document Validator**\n\n"
-            "Send me a document number to validate.\n\n"
-            "Examples:\n"
-            "• NIN: `12345678901`\n"
-            "• ID Card: `ID-2024-001`\n"
-            "• License: `DL-123456`\n"
-            "• Passport: `PP-123456`\n\n"
-            "Send /cancel to cancel.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        context.user_data["action"] = "validate_doc"
-        
-    # ===== SETTINGS =====
-    
-    elif action == "change_color":
-        await query.edit_message_text(
-            "🎨 **Select Color Scheme**\n\n"
-            "Choose a color for your documents:",
-            parse_mode="Markdown",
-            reply_markup=get_color_keyboard()
-        )
-        
-    elif action.startswith("color_"):
-        color = action.replace("color_", "")
-        data["settings"]["color_scheme"] = color
-        await query.edit_message_text(
-            f"✅ **Color Updated!**\n\n"
-            f"New color scheme: {color.capitalize()}",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        
-    # ===== STATS =====
-    
-    elif action == "stats":
-        doc_counts = {}
-        for entry in data.get("history", []):
-            doc_type = entry.get("type", "unknown")
-            doc_counts[doc_type] = doc_counts.get(doc_type, 0) + 1
-        
-        stats_text = (
-            f"📊 **Your Statistics**\n\n"
-            f"📋 Total documents: {data['total_generated']}\n"
-            f"📅 Account active since: {datetime.now().strftime('%Y-%m-%d')}\n\n"
-        )
-        
-        if doc_counts:
-            stats_text += "📈 **Document Types:**\n"
-            for doc_type, count in doc_counts.items():
-                doc_name = DOCUMENT_TYPES.get(doc_type, {}).get("name", doc_type)
-                stats_text += f"• {doc_name}: {count}\n"
-        
-        await query.edit_message_text(
-            stats_text,
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        
-    # ===== HELP =====
-    
-    elif action == "help":
-        await help_command(update, context)
-        
-    # ===== BACK =====
-    
-    elif action == "back":
-        await query.edit_message_text(
-            "🏠 **Main Menu**\n\n"
-            "What would you like to do?",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        context.user_data["action"] = None
-        
-    # ===== EXPORT =====
-    
-    elif action.startswith("export_"):
-        await query.edit_message_text(
-            "📥 **Export Feature**\n\n"
-            "This feature will be available soon!\n\n"
-            "You can already download images directly from Telegram.",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-
-# ==================== HELPER FUNCTIONS ====================
-
-async def generate_document(query, doc_type, data):
-    """Generate a document and send it"""
-    doc_type_map = {
-        "id_card": ("gen_id", "🪪 ID Card Generator"),
-        "nin": ("gen_nin", "🔢 NIN Generator"),
-        "drivers_license": ("gen_license", "🚗 Driver's License Generator"),
-        "passport": ("gen_passport", "🛂 Passport Generator"),
-        "voter_id": ("gen_voter", "🗳️ Voter ID Generator"),
-        "student_id": ("gen_student", "🎓 Student ID Generator"),
-    }
-    
-    if doc_type in doc_type_map:
-        callback, label = doc_type_map[doc_type]
-        await query.edit_message_text(
-            f"**{label}**\n\n"
-            "Generating your document...\n"
-            "Please wait ⏳",
+    except Exception as e:
+        logger.error(f"Photo upload error: {e}")
+        await update.message.reply_text(
+            "❌ **Error uploading photo**\n\n"
+            "Please try again.",
             parse_mode="Markdown"
         )
-        
-        # Trigger generation
-        await button_handler(query.update, query.context)
+    
+    return ConversationHandler.END
 
-# ==================== MESSAGE HANDLERS ====================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages for validation and conversion"""
-    user_id = str(update.effective_user.id)
+async def view_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View uploaded photo"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
     data = get_user_data(user_id)
-    text = update.message.text.strip()
-    action = context.user_data.get("action", "")
     
-    if not text:
-        await update.message.reply_text(
-            "❌ Please send some text!",
-            reply_markup=get_main_keyboard()
-        )
-        return
-    
-    # ===== CANCEL =====
-    
-    if text.lower() == "/cancel":
-        context.user_data["action"] = None
-        await update.message.reply_text(
-            "✅ Cancelled!",
-            reply_markup=get_main_keyboard()
-        )
-        return
-    
-    # ===== DOCUMENT CONVERTER =====
-    
-    if action == "convert_doc":
-        # Try to detect document type
-        doc_type = "unknown"
-        if text.startswith("ID-"):
-            doc_type = "id_card"
-        elif len(text) == 11 and text.isdigit():
-            doc_type = "nin"
-        elif text.startswith("DL-"):
-            doc_type = "drivers_license"
-        elif text.startswith("PP-"):
-            doc_type = "passport"
-        elif text.startswith("VID-"):
-            doc_type = "voter_id"
-        elif text.startswith("SID-"):
-            doc_type = "student_id"
-        
-        # Convert to another format
-        target_type = "id_card" if doc_type != "id_card" else "nin"
-        result = convert_document(text, doc_type, target_type)
-        
-        await update.message.reply_text(
-            f"🔄 **Document Conversion**\n\n"
-            f"Input: {text}\n"
-            f"Type: {doc_type.upper()}\n"
-            f"Converted to: {target_type.upper()}\n\n"
-            f"{result['message']}\n"
-            f"Result: `{result['converted_data']}`" if result['success'] else result['message'],
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        context.user_data["action"] = None
-        
-    # ===== DOCUMENT VALIDATOR =====
-    
-    elif action == "validate_doc":
-        # Try to detect document type
-        doc_type = "unknown"
-        if text.startswith("ID-"):
-            doc_type = "id_card"
-        elif len(text) == 11 and text.isdigit():
-            doc_type = "nin"
-        elif text.startswith("DL-"):
-            doc_type = "drivers_license"
-        elif text.startswith("PP-"):
-            doc_type = "passport"
-        elif text.startswith("VID-"):
-            doc_type = "voter_id"
-        elif text.startswith("SID-"):
-            doc_type = "student_id"
-        
-        if doc_type == "unknown":
-            await update.message.reply_text(
-                "❌ Could not detect document type.\n\n"
-                "Please send a valid document number.",
+    if data.get("photos") and len(data["photos"]) > 0:
+        photo_data = data["photos"][-1].get("processed")
+        if photo_data:
+            await query.message.reply_photo(
+                photo=io.BytesIO(photo_data),
+                caption="📸 **Your Uploaded Photo**\n\n"
+                       "This photo will be used on your ID documents.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                "❌ No photo found. Please upload one.",
+                parse_mode="Markdown",
                 reply_markup=get_main_keyboard()
             )
-            return
+    else:
+        await query.edit_message_text(
+            "❌ No photo found. Please upload one.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Upload Photo", callback_data="upload_photo")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back")]
+            ])
+        )
+
+# ==================== DOCUMENT GENERATION HANDLERS ====================
+
+async def generate_id_with_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate ID card with photo"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    # Get photo
+    photo_data = None
+    if data.get("photos") and len(data["photos"]) > 0:
+        photo_data = data["photos"][-1].get("processed")
+    
+    # Generate ID
+    img_data = generate_id_card_with_photo(data.get("personal_info", {}), photo_data)
+    
+    if img_data:
+        data["total_generated"] += 1
+        data["documents"].append({
+            "type": "id_card",
+            "generated_at": datetime.now().isoformat()
+        })
         
-        result = validate_id_number(text, doc_type)
-        
-        await update.message.reply_text(
-            f"✅ **Document Validation**\n\n"
-            f"Document: {text}\n"
-            f"Type: {doc_type.upper()}\n\n"
-            f"{result['message']}",
+        await query.message.reply_photo(
+            photo=io.BytesIO(img_data),
+            caption="🪪 **Your ID Card**\n\n"
+                   f"Name: {data.get('personal_info', {}).get('full_name', 'N/A')}\n"
+                   f"ID: {data.get('id_number', 'N/A')}\n"
+                   f"Status: {'✅ Verified' if data.get('status') == 'verified' else '⏳ Pending'}\n\n"
+                   "🔒 This is a secure official document.",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard()
         )
-        context.user_data["action"] = None
-        
     else:
-        await update.message.reply_text(
-            "📋 **Use the buttons below!**\n\n"
-            "I can generate various identity documents.\n"
-            "Just click a button to get started!",
+        await query.edit_message_text(
+            "❌ Failed to generate ID card. Please try again.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+
+async def generate_nin_with_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate NIN with photo"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    photo_data = None
+    if data.get("photos") and len(data["photos"]) > 0:
+        photo_data = data["photos"][-1].get("processed")
+    
+    if not data.get("verification", {}).get("nin"):
+        data["verification"]["nin"] = f"{random.randint(10000000000, 99999999999)}"
+    
+    img_data = generate_nin_with_photo(data.get("personal_info", {}), photo_data)
+    
+    if img_data:
+        data["total_generated"] += 1
+        data["documents"].append({
+            "type": "nin",
+            "generated_at": datetime.now().isoformat()
+        })
+        
+        await query.message.reply_photo(
+            photo=io.BytesIO(img_data),
+            caption="🔢 **Your NIN Card**\n\n"
+                   f"Name: {data.get('personal_info', {}).get('full_name', 'N/A')}\n"
+                   f"NIN: {data.get('verification', {}).get('nin', 'N/A')}\n"
+                   f"Status: {'✅ Verified' if data.get('status') == 'verified' else '⏳ Pending'}\n\n"
+                   "🔒 This is a secure official document.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await query.edit_message_text(
+            "❌ Failed to generate NIN. Please try again.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+
+async def generate_license_with_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate Driver's License with photo"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = str(query.from_user.id)
+    data = get_user_data(user_id)
+    
+    photo_data = None
+    if data.get("photos") and len(data["photos"]) > 0:
+        photo_data = data["photos"][-1].get("processed")
+    
+    if not data.get("verification", {}).get("license_number"):
+        data["verification"]["license_number"] = f"DL-{random.randint(100000, 999999)}"
+    
+    img_data = generate_drivers_license_with_photo(data.get("personal_info", {}), photo_data)
+    
+    if img_data:
+        data["total_generated"] += 1
+        data["documents"].append({
+            "type": "drivers_license",
+            "generated_at": datetime.now().isoformat()
+        })
+        
+        await query.message.reply_photo(
+            photo=io.BytesIO(img_data),
+            caption="🚗 **Your Driver's License**\n\n"
+                   f"Name: {data.get('personal_info', {}).get('full_name', 'N/A')}\n"
+                   f"License: {data.get('verification', {}).get('license_number', 'N/A')}\n"
+                   f"Status: {'✅ Verified' if data.get('status') == 'verified' else '⏳ Pending'}\n\n"
+                   "🔒 This is a secure official document.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await query.edit_message_text(
+            "❌ Failed to generate Driver's License. Please try again.",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard()
         )
@@ -1107,12 +1020,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     """Post initialization"""
     logger.info("=" * 60)
-    logger.info(f"📋 {BOT_NAME} Started Successfully!")
+    logger.info(f"🔐 {BOT_NAME} Started Successfully!")
     logger.info(f"🤖 Username: @{BOT_USERNAME}")
     logger.info(f"📦 Version: {BOT_VERSION}")
-    logger.info(f"📄 Document Types: {len(DOCUMENT_TYPES)}")
+    logger.info(f"📸 Photo Upload Support: Enabled")
     logger.info("=" * 60)
-    logger.info("✅ Bot is ready to generate documents!")
+    logger.info("✅ Bot is ready with photo upload support!")
     logger.info("=" * 60)
 
 def main():
@@ -1125,19 +1038,152 @@ def main():
         .post_init(post_init) \
         .build()
     
+    # Conversation handler for registration
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("register", register_start),
+            CallbackQueryHandler(register_start, pattern="^register$")
+        ],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+            DOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_dob)],
+            GENDER: [CallbackQueryHandler(register_gender, pattern="^gender_")],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_phone)],
+            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
+            COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_country)],
+            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_address)],
+            ID_TYPE: [CallbackQueryHandler(register_id_type, pattern="^id_type_")],
+            ID_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_id_number)],
+            NIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_nin)],
+            BVN: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_bvn)],
+            CONSENT: [CallbackQueryHandler(register_consent, pattern="^(consent_|privacy_policy)")],
+        },
+        fallbacks=[CommandHandler("cancel", start)],
+        name="registration"
+    )
+    
+    # Photo upload conversation handler
+    photo_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(upload_photo_start, pattern="^upload_photo$"),
+            CallbackQueryHandler(upload_photo_start, pattern="^change_photo$")
+        ],
+        states={
+            PHOTO_UPLOAD: [MessageHandler(filters.PHOTO, handle_photo)]
+        },
+        fallbacks=[CommandHandler("cancel", start)],
+        name="photo_upload"
+    )
+    
+    # Add handlers
+    application.add_handler(conv_handler)
+    application.add_handler(photo_conv_handler)
+    
     # Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
     
-    # Callback handler
-    application.add_handler(CallbackQueryHandler(button_handler))
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(view_photo, pattern="^view_photo$"))
+    application.add_handler(CallbackQueryHandler(generate_id_with_photo, pattern="^gen_id$"))
+    application.add_handler(CallbackQueryHandler(generate_nin_with_photo_handler, pattern="^gen_nin$"))
+    application.add_handler(CallbackQueryHandler(generate_license_with_photo_handler, pattern="^gen_license$"))
+    
+    # Generic callback handler
+    application.add_handler(CallbackQueryHandler(handle_generic_callback))
     
     # Message handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     logger.info("✅ Bot is polling for updates...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def handle_generic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle generic callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    action = query.data
+    
+    if action == "back":
+        await query.edit_message_text(
+            "🏠 **Main Menu**\n\n"
+            "What would you like to do?",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+    elif action == "my_docs":
+        user_id = str(query.from_user.id)
+        data = get_user_data(user_id)
+        
+        if data.get("documents"):
+            docs_text = "📋 **Your Documents**\n\n"
+            for idx, doc in enumerate(data["documents"], 1):
+                docs_text += f"{idx}. {doc.get('type', 'Unknown')} - {doc.get('generated_at', 'N/A')[:10]}\n"
+            await query.edit_message_text(
+                docs_text,
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                "📋 No documents generated yet.\n\n"
+                "Generate your ID, NIN, or Driver's License!",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard()
+            )
+    elif action == "verification_status":
+        user_id = str(query.from_user.id)
+        data = get_user_data(user_id)
+        
+        status_map = {
+            "pending": "⏳ Pending",
+            "pending_verification": "⏳ Under Review",
+            "photo_uploaded": "📸 Photo Uploaded",
+            "verified": "✅ Verified",
+            "rejected": "❌ Rejected"
+        }
+        
+        status_text = (
+            f"📊 **Verification Status**\n\n"
+            f"Status: {status_map.get(data.get('status', 'pending'), 'Unknown')}\n"
+            f"Name: {data.get('personal_info', {}).get('full_name', 'Not provided')}\n"
+            f"ID Number: {data.get('id_number', 'Not generated')}\n"
+            f"Photo: {'✅ Uploaded' if data.get('photos') else '❌ Not uploaded'}\n"
+            f"Documents Generated: {len(data.get('documents', []))}\n"
+            f"Registration Date: {data.get('registration_date', 'N/A')[:10]}\n\n"
+            "Complete your registration by uploading a photo and generating documents!"
+        )
+        
+        await query.edit_message_text(
+            status_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Upload Photo", callback_data="upload_photo")],
+                [InlineKeyboardButton("🪪 Generate ID", callback_data="gen_id")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back")]
+            ])
+        )
+    elif action == "delete_data":
+        user_id = str(query.from_user.id)
+        if user_id in user_data:
+            del user_data[user_id]
+        await query.edit_message_text(
+            "🗑️ **Data Deleted Successfully!**\n\n"
+            "All your personal data has been removed from our system.\n\n"
+            "You can start fresh anytime with /start",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    await update.message.reply_text(
+        "📋 **Use the buttons below!**\n\n"
+        "Start your registration or generate documents.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
+    )
 
 if __name__ == "__main__":
     main()
